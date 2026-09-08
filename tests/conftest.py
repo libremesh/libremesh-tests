@@ -176,12 +176,19 @@ def ssh_command(shell_command, target):
 
 
 @pytest.fixture(scope="session", autouse=True)
-def collect_lime_report(target):
+def collect_lime_report(pytestconfig):
     """Collect lime-report after all session tests finish.
 
     Runs as a session-scoped autouse fixture so it tears down BEFORE
     labgrid's ``env.cleanup()`` — the SSHDriver is still active here.
     Writes the output to the path in ``LIME_REPORT_OUTPUT`` if set.
+
+    Resolves the labgrid target lazily via pytestconfig.stash instead of
+    depending on the ``target`` fixture directly, mirroring the pattern used
+    by ``setup_env``. This is required because multi-node mesh tests
+    (conftest_mesh.py) run without ``--lg-env`` and therefore labgrid never
+    creates an ``env``. If this fixture depended on ``target``, every mesh
+    session would be aborted with ``missing environment config (use --lg-env)``.
     """
     yield
 
@@ -190,6 +197,21 @@ def collect_lime_report(target):
         return
 
     try:
+        from labgrid.pytestplugin.hooks import LABGRID_ENV_KEY
+
+        env = pytestconfig.stash.get(LABGRID_ENV_KEY, None)
+    except (ImportError, KeyError):
+        env = None
+
+    if env is None:
+        # No labgrid env active (typical for multi-node mesh tests): skip
+        # lime-report silently; mesh-specific reporting lives in conftest_mesh.
+        return
+
+    try:
+        target = env.get_target()
+        if target is None:
+            return
         ssh = target.get_driver("SSHDriver")
         stdout, stderr, rc = ssh.run("lime-report", timeout=60)
         output = "\n".join(stdout).strip()
