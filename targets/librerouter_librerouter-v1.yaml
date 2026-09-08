@@ -1,4 +1,15 @@
-# LibreRouter v1 (ath79) - See docs/target-quirks.md for details
+# LibreRouter v1 (ath79) - single-image variant
+#
+# This target boots from a self-contained `*-initramfs-kernel.bin` image
+# (kernel with LibreMesh CPIO embedded via CONFIG_INITRAMFS_SOURCE). It is
+# the default for:
+#   - Mesh tests (mesh_boot_node.py sets only LG_IMAGE per node).
+#   - Local single-node runs with a LibreMesh release image.
+#   - openwrt-tests healthcheck (labnet.yaml maps here).
+#
+# For pi-lime-packages CI (ImageBuilder cannot build initramfs kernels;
+# ships kernel.bin + rootfs.uimage separately) use the dual-TFTP variant:
+#   targets/librerouter_librerouter-v1-dual-tftp.yaml
 targets:
   main:
     features:
@@ -14,15 +25,15 @@ targets:
           txdelay: 0.01
       - UBootDriver:
           login_timeout: 30
+          # A single newline aborts autoboot within the 2s bootdelay window;
+          # tftpstrategy._spam_uboot_interrupt blasts these for ~12s to be
+          # robust against serial-console jitter on the ath79 U-Boot 1.1.x.
           interrupt: "\n"
           autoboot: "Hit any key to stop autoboot"
           prompt: "ath>"
-          # Dual-TFTP: kernel + ramdisk uImage (ath79 has no initramfs support)
-          # 0x84000FC0 aligns CPIO data to page boundary at 0x84001000
           init_commands:
             - "tftp 0x82000000"
-            - "tftp 0x84000FC0 ${bootfile_initrd}"
-          boot_command: "bootm 0x82000000 0x84000FC0"
+          boot_command: "bootm 0x82000000"
       - ShellDriver:
           prompt: "(?:\\x1b\\][^\\x07]*\\x07)?(?:\\x1b\\[[\\d;]*m)*root@LiMe-[0-9A-Fa-f]{6}:[^ ]*[#$] "
           login_prompt: Please press Enter to activate this console.
@@ -37,7 +48,6 @@ targets:
 
 images:
   root: !template $LG_IMAGE
-  initrd: !template $LG_IMAGE_INITRD
 
 imports:
   - ../strategies/tftpstrategy.py

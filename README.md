@@ -49,7 +49,8 @@ Only DUTs used for LibreMesh / FCEFyN workflows:
 | `targets/openwrt_one.yaml` | OpenWrt One |
 | `targets/bananapi_bpi-r4.yaml` | Banana Pi R4 |
 | `targets/linksys_e8450.yaml` | Belkin RT3200 / Linksys E8450 |
-| `targets/librerouter_librerouter-v1.yaml` | LibreRouter v1 |
+| `targets/librerouter_librerouter-v1.yaml` | LibreRouter v1 (single-image, default) |
+| `targets/librerouter_librerouter-v1-dual-tftp.yaml` | LibreRouter v1 (kernel + rootfs.uimage, for lime-packages CI) |
 | `targets/qemu_x86-64_libremesh.yaml` | QEMU x86-64 LibreMesh |
 
 ## Running tests
