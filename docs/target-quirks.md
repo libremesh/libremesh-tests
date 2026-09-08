@@ -31,12 +31,23 @@ Even though `pi-lime-packages` embeds `bootargs` in the FIT configuration node, 
 
 ## LibreRouter v1 (ath79)
 
-**Target files (two variants):**
+**Target files (two variants, each with a short-name symlink):**
 
 | File | When to use | Required env vars |
 |---|---|---|
-| `targets/librerouter_librerouter-v1.yaml` | Default. Boots a self-contained `*-initramfs-kernel.bin` (LibreMesh releases, source builds, mesh tests, `openwrt-tests` healthcheck via `labnet.yaml`). | `LG_IMAGE` |
-| `targets/librerouter_librerouter-v1-dual-tftp.yaml` | `pi-lime-packages` / `lime-packages` CI when ImageBuilder emits `kernel.bin` + `rootfs.uimage` separately. | `LG_IMAGE` + `LG_IMAGE_INITRD` |
+| `targets/librerouter_librerouter-v1.yaml` (canonical) | Default. Boots a self-contained `*-initramfs-kernel.bin` (LibreMesh releases, source builds, mesh tests, `openwrt-tests` healthcheck via `labnet.yaml`). | `LG_IMAGE` |
+| `targets/librerouter_v1.yaml` (symlink) | Same as above; kept for callers that use the short OpenWrt device profile name (`dut-config.yaml` + `pi-lime-packages` `matrix.device`). | `LG_IMAGE` |
+| `targets/librerouter_librerouter-v1-dual-tftp.yaml` (canonical) | `pi-lime-packages` / `lime-packages` CI when ImageBuilder emits `kernel.bin` + `rootfs.uimage` separately. | `LG_IMAGE` + `LG_IMAGE_INITRD` |
+| `targets/librerouter_v1-dual-tftp.yaml` (symlink) | Same as above, short-name flavor used by `tools/ci/lab_stage_firmware.sh` (`DUAL_ENV="targets/${DEVICE}-dual-tftp.yaml"`). | `LG_IMAGE` + `LG_IMAGE_INITRD` |
+
+### Two naming conventions
+
+The librerouter has two device names in the wider testbed ecosystem:
+
+- **`librerouter_v1`** (short, matches the OpenWrt ath79 device profile) is used by `fcefyn_testbed_utils/configs/dut-config.yaml`, the `pi-lime-packages` build matrix, and any script that starts from the OpenWrt device profile.
+- **`librerouter_librerouter-v1`** (long, `<vendor>_<profile>`) is used by `openwrt-tests/labnet.yaml`, labgrid `RemotePlace` names, and the exporter YAML.
+
+The canonical file uses the long form so `conftest_mesh.py::resolve_target_yaml()` (which resolves through `labnet.yaml`) finds it directly. The short-form symlinks let `lime-packages` CI and any other short-name caller resolve to the same file without duplicating the YAML.
 
 ### Dual-TFTP Boot
 
