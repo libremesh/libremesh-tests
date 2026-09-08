@@ -15,7 +15,11 @@ dependencies = [
 labgrid = { git = "https://github.com/aparcar/labgrid.git", branch = "aparcar/staging" }
 
 [dependency-groups]
-dev = ["isort>=6.0.1", "ruff>=0.12.0"]
+# Ruff is capped below 0.16: newer releases enable additional default lint
+# rules (RUF059, PIE810, ...) that flag pre-existing patterns in the
+# codebase, breaking CI on every new PR without any related code change.
+# Bump this cap deliberately when we opt into the new rules.
+dev = ["isort>=6.0.1", "ruff>=0.12.0,<0.16"]
 
 [tool.isort]
 profile = "black"

@@ -1,0 +1,59 @@
+# LibreRouter v1 (ath79) - dual-TFTP variant (kernel + rootfs ramdisk).
+#
+# Use this variant only when the boot artifact is split into two files:
+#   - kernel.bin (uImage with lzma kernel + appended DTB)
+#   - rootfs.uimage (newc CPIO with LibreMesh rootfs, uImage-wrapped)
+#
+# Required env vars: LG_IMAGE (kernel) and LG_IMAGE_INITRD (rootfs).
+#
+# This is used by pi-lime-packages / lime-packages CI because ImageBuilder
+# cannot rebuild the kernel with CONFIG_INITRAMFS_SOURCE, so the ath79
+# artifact is delivered as two separate blobs.
+#
+# For self-contained *-initramfs-kernel.bin (LibreMesh releases, source
+# builds, mesh tests) use the single-image default:
+#   targets/librerouter_librerouter-v1.yaml
+#
+# See docs/target-quirks.md for details on the ath79 dual-image rationale.
+targets:
+  main:
+    features:
+      - wan_port
+      - wifi
+    resources:
+      RemotePlace:
+        name: !template "$LG_PLACE"
+    drivers:
+      - PDUDaemonDriver: {}
+      - TFTPProviderDriver: {}
+      - SerialDriver:
+          txdelay: 0.01
+      - UBootDriver:
+          login_timeout: 30
+          interrupt: "\n"
+          autoboot: "Hit any key to stop autoboot"
+          prompt: "ath>"
+          # Dual-TFTP: kernel + ramdisk uImage (ath79 has no initramfs support)
+          # 0x84000FC0 aligns CPIO data to page boundary at 0x84001000
+          init_commands:
+            - "tftp 0x82000000"
+            - "tftp 0x84000FC0 ${bootfile_initrd}"
+          boot_command: "bootm 0x82000000 0x84000FC0"
+      - ShellDriver:
+          prompt: "(?:\\x1b\\][^\\x07]*\\x07)?(?:\\x1b\\[[\\d;]*m)*root@LiMe-[0-9A-Fa-f]{6}:[^ ]*[#$] "
+          login_prompt: Please press Enter to activate this console.
+          await_login_timeout: 15
+          login_timeout: 180
+          post_login_settle_time: 5
+          username: root
+      - UBootTFTPStrategy: {}
+      - SSHDriver:
+          connection_timeout: 120.0
+          explicit_scp_mode: True
+
+images:
+  root: !template $LG_IMAGE
+  initrd: !template $LG_IMAGE_INITRD
+
+imports:
+  - ../strategies/tftpstrategy.py

@@ -31,7 +31,12 @@ Even though `pi-lime-packages` embeds `bootargs` in the FIT configuration node, 
 
 ## LibreRouter v1 (ath79)
 
-**Target file:** `targets/librerouter_v1.yaml`
+**Target files (two variants):**
+
+| File | When to use | Required env vars |
+|---|---|---|
+| `targets/librerouter_librerouter-v1.yaml` | Default. Boots a self-contained `*-initramfs-kernel.bin` (LibreMesh releases, source builds, mesh tests, `openwrt-tests` healthcheck via `labnet.yaml`). | `LG_IMAGE` |
+| `targets/librerouter_librerouter-v1-dual-tftp.yaml` | `pi-lime-packages` / `lime-packages` CI when ImageBuilder emits `kernel.bin` + `rootfs.uimage` separately. | `LG_IMAGE` + `LG_IMAGE_INITRD` |
 
 ### Dual-TFTP Boot
 
