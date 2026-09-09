@@ -35,14 +35,28 @@ targets:
             - "tftp 0x82000000"
           boot_command: "bootm 0x82000000"
       - ShellDriver:
-          # Accept any LibreMesh/OpenWrt hostname, not only the default
-          # LiMe-<MAC6> pattern. Images built with a fixed hostname in
-          # /etc/config/lime (e.g. `margarita` on some LibreRouter batches)
-          # would otherwise never match and _await_login() timed out at 180s.
-          prompt: "(?:\\x1b\\][^\\x07]*\\x07)?(?:\\x1b\\[[\\d;]*m)*root@[\\w()-]+:[^ ]*[#$] "
+          # Simple prompt regex that finds `root@<host>:<path><#|$> ` anywhere
+          # in the pexpect buffer. Two constraints matter for the LR:
+          #   * The image emits a PS1 with an OSC title (\x1b]0;...\x07) before
+          #     the actual prompt. The previous regex tried to match that OSC
+          #     prefix explicitly with `[^\x07]*` quantifiers; while correct on
+          #     paper (verified with re.search on the captured bytes), the
+          #     combined optionals+quantifiers on a 30 KB boot buffer caused
+          #     ShellDriver._await_login() to time out at 180s repeatedly on
+          #     lime-packages CI (run 34374110551).
+          #   * Images with a fixed hostname in /etc/config/lime (e.g. the
+          #     `margarita` batch shipped on the LR at labgrid-fcefyn) never
+          #     satisfied the previous `root@LiMe-[0-9A-Fa-f]{6}:` regex.
+          # \S+:\S* keeps the match at the raw prompt after any prefix; re.search
+          # locates it regardless of what precedes.
+          prompt: "root@\\S+:\\S*[#$] "
           login_prompt: Please press Enter to activate this console.
           await_login_timeout: 15
-          login_timeout: 180
+          # Bumped from 180s: LR TFTP-booted with the single-image variant
+          # boots slowly (initramfs + full LibreMesh init) and the buffer
+          # catches up only after several _await_login iterations. 600s = 40
+          # retries.
+          login_timeout: 600
           post_login_settle_time: 5
           username: root
       - UBootTFTPStrategy: {}
