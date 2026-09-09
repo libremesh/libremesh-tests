@@ -47,9 +47,14 @@ targets:
           #   * Images with a fixed hostname in /etc/config/lime (e.g. the
           #     `margarita` batch shipped on the LR at labgrid-fcefyn) never
           #     satisfied the previous `root@LiMe-[0-9A-Fa-f]{6}:` regex.
-          # \S+:\S* keeps the match at the raw prompt after any prefix; re.search
-          # locates it regardless of what precedes.
-          prompt: "root@\\S+:\\S*[#$] "
+          # The regex allows an optional OSC title (\x1b]...\x07) and any
+          # number of ANSI SGR color codes (\x1b[...m) before `root@`.
+          # This is required because labgrid.ShellDriver._check_prompt() runs
+          # right after _await_login() and matches internally as
+          # `<marker>\s+<self.prompt>`; \s+ only consumes whitespace so
+          # <self.prompt> must accept the LR PS1 escape sequences that appear
+          # between the echoed marker and the actual `root@...` text.
+          prompt: "(?:\\x1b\\][^\\x07]*\\x07)?(?:\\x1b\\[[\\d;]*m)*root@\\S+:\\S*[#$] "
           login_prompt: Please press Enter to activate this console.
           await_login_timeout: 15
           # Bumped from 180s: LR TFTP-booted with the single-image variant

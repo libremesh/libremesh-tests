@@ -19,10 +19,10 @@ class TestLibreMeshConfig:
     """Verify LibreMesh configuration files and packages are present."""
 
     def test_lime_config_package_installed(self, ssh_command):
-        """Verify lime-system package is installed.
+        """Verify lime-system or lime-config package is installed.
 
-        Note: OpenWrt 24.10+ uses apk instead of opkg. The lime-config script
-        lives inside lime-system; it is not a separate package.
+        Note: OpenWrt 24.10+ uses apk instead of opkg, and newer LibreMesh
+        builds use lime-system instead of lime-config.
         """
         # Try apk first (OpenWrt 24.10+), then opkg
         stdout, _, rc = ssh_command.run(
@@ -30,8 +30,10 @@ class TestLibreMeshConfig:
         )
         installed = "\n".join(stdout) if stdout else ""
 
-        assert "lime-system" in installed, (
-            "lime-system package not found. Is this a LibreMesh image?"
+        # Check for lime-system (newer) or lime-config (older)
+        has_lime = "lime-system" in installed or "lime-config" in installed
+        assert has_lime, (
+            "Neither lime-system nor lime-config package found. Is this a LibreMesh image?"
         )
 
     def test_lime_defaults_uci_present(self, ssh_command):
