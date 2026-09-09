@@ -40,7 +40,11 @@ targets:
             - "tftp 0x84000FC0 ${bootfile_initrd}"
           boot_command: "bootm 0x82000000 0x84000FC0"
       - ShellDriver:
-          prompt: "(?:\\x1b\\][^\\x07]*\\x07)?(?:\\x1b\\[[\\d;]*m)*root@LiMe-[0-9A-Fa-f]{6}:[^ ]*[#$] "
+          # Accept any LibreMesh/OpenWrt hostname, not only the default
+          # LiMe-<MAC6> pattern. Images built with a fixed hostname in
+          # /etc/config/lime (e.g. `margarita` on some LibreRouter batches)
+          # would otherwise never match and _await_login() timed out at 180s.
+          prompt: "(?:\\x1b\\][^\\x07]*\\x07)?(?:\\x1b\\[[\\d;]*m)*root@[\\w()-]+:[^ ]*[#$] "
           login_prompt: Please press Enter to activate this console.
           await_login_timeout: 15
           login_timeout: 180
