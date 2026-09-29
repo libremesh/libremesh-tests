@@ -53,7 +53,21 @@ logger = logging.getLogger(__name__)
 
 BOOT_SCRIPT = Path(__file__).parent / "mesh_boot_node.py"
 
-BOOT_TIMEOUT_BASE = 420
+# One U-Boot capture attempt costs: power cycle + interrupt-spam tail +
+# serial drain + UBootDriver login_timeout. The power cycle dominates and
+# depends on the power backend: Arduino relay DUTs cycle in ~9s, while PoE
+# ports go through PDUDaemon -> SSH -> TP-Link switch and take 88-102s
+# (measured on openwrt_one). UBootTFTPStrategy retries the capture up to
+# 1 + LG_MESH_UBOOT_RETRIES times, so this budget must cover the slowest
+# backend times the full retry count. It previously assumed a single retry
+# at ~130s, which killed openwrt_one 20s after its third attempt had already
+# captured U-Boot and completed TFTP.
+UBOOT_ATTEMPT_WORST_CASE = 145
+UBOOT_MAX_ATTEMPTS = 3
+# TFTP download + kernel handoff + LibreMesh init + fixed-IP assignment.
+POST_UBOOT_BOOT_BUDGET = 150
+
+BOOT_TIMEOUT_BASE = UBOOT_ATTEMPT_WORST_CASE * UBOOT_MAX_ATTEMPTS + POST_UBOOT_BOOT_BUDGET
 BOOT_TIMEOUT_PER_NODE = 30
 NETWORK_SETTLE_TIMEOUT = 60
 SUBPROCESS_SHUTDOWN_TIMEOUT = 30
@@ -284,8 +298,8 @@ def _compute_boot_timeout(node_count: int) -> int:
     """Scale the boot timeout with node count.
 
     The U-Boot gate serializes power-cycle + TFTP capture across all nodes.
-    Each node holds the gate for ~30s, and a single U-Boot retry adds ~130s.
-    The base timeout covers 3 nodes comfortably; each extra node adds
+    The base timeout covers 3 nodes running the full U-Boot retry policy on
+    the slowest power backend (see BOOT_TIMEOUT_BASE); each extra node adds
     BOOT_TIMEOUT_PER_NODE seconds.
     """
     extra_nodes = max(0, node_count - 3)

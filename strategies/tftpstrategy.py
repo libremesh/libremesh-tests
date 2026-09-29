@@ -325,6 +325,7 @@ class UBootTFTPStrategy(Strategy):
             interval,
         )
 
+        spam_started = time.monotonic()
         stop = threading.Event()
         state = {"writes": 0, "errors": 0}
 
@@ -356,10 +357,14 @@ class UBootTFTPStrategy(Strategy):
             stop.set()
             writer.join(timeout=interval * 4 + 1.0)
 
-        logger.debug(
-            "U-Boot interrupt spam sent %d writes (%d failed)",
+        # INFO, not DEBUG: when a U-Boot capture fails this is the only way to
+        # tell whether the interrupt bytes reached the console at all or the
+        # console was unusable for the whole power-cycle window.
+        logger.info(
+            "U-Boot interrupt spam sent %d writes (%d failed) over %.1fs",
             state["writes"],
             state["errors"],
+            time.monotonic() - spam_started,
         )
 
     def _transition_to_uboot_once(self):
