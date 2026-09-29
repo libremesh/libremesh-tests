@@ -1,10 +1,12 @@
 import enum
+import fcntl
 import hashlib
 import ipaddress
 import logging
 import os
 import threading
 import time
+from contextlib import contextmanager
 
 import attr
 from labgrid.driver import TFTPProviderDriver
@@ -18,12 +20,22 @@ TFTP_DOWNLOAD_TIMEOUT = 120
 TFTP_RETRY_INTERVAL = 5
 DEFAULT_UBOOT_RETRIES = 2
 DEFAULT_UBOOT_RETRY_COOLDOWN = 5
-DEFAULT_UBOOT_RETRY_BUDGET = 360
+# Wall-clock ceiling for all U-Boot capture attempts of a single boot. Sized
+# for three captures on the slowest power backend (~145s each on a PoE port:
+# ~95s power cycle via PDUDaemon and the switch, plus spam tail, serial drain
+# and login_timeout). Keep in sync with UBOOT_CAPTURE_BUDGET in
+# tests/conftest_mesh.py, which reserves this much inside its own budget.
+DEFAULT_UBOOT_RETRY_BUDGET = 450
 SERIAL_DRAIN_CHUNK = 4096
 SERIAL_DRAIN_TIMEOUT = 0.5
 SERIAL_DRAIN_TOTAL_MAX = 3.0
-DEFAULT_UBOOT_INTERRUPT_SPAM_SEC = 12.0
+# Belkin RT3200 BL2/BL31 take ~12s before the U-Boot countdown starts; 12s of
+# trailing spam after power-on is not enough to cover that. 25s covers both
+# that board and the OpenWrt One (whose window is only 1-3s after PoE returns).
+DEFAULT_UBOOT_INTERRUPT_SPAM_SEC = 25.0
 DEFAULT_UBOOT_INTERRUPT_SPAM_INTERVAL = 0.05
+DEFAULT_POWER_OFF_SETTLE_SEC = 2.0
+DEFAULT_UBOOT_CAPTURE_LOCK = "/tmp/labgrid-uboot-capture.lock"
 
 
 class Status(enum.Enum):
@@ -73,26 +85,92 @@ def _read_float_env(name: str, default: float) -> float:
     return value
 
 
+@contextmanager
+def _uboot_capture_lock():
+    """Serialize the power-on + autoboot window across mesh boot subprocesses.
+
+    Mesh tests launch one process per DUT. All of them talk to PDUDaemon, and
+    both the Arduino relay script and the PoE switch script serialize on the
+    same ``/tmp/switch.lock``. Without a capture lock the three HTTP `reboot`
+    calls queue behind each other: the OpenWrt One stays powered on for ~90s
+    (spam writing into a live Linux console) and only then actually cycles,
+    long after the 1-3s autoboot window has closed.
+
+    Holding this lock only around off/on + U-Boot prompt capture (not TFTP)
+    lets the other nodes download in parallel once they have a prompt.
+    """
+    path = os.environ.get("LG_UBOOT_CAPTURE_LOCK", DEFAULT_UBOOT_CAPTURE_LOCK)
+    if not path or path in ("0", "off", "disable"):
+        yield
+        return
+
+    fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o666)
+    try:
+        logger.info("Waiting for U-Boot capture lock (%s)", path)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        logger.info("Acquired U-Boot capture lock")
+        yield
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
 def _retry_action(
-    action, cleanup, retries: int, cooldown: int, label: str, sleep_fn=time.sleep
+    action,
+    cleanup,
+    retries: int,
+    cooldown: int,
+    label: str,
+    sleep_fn=time.sleep,
+    deadline=None,
 ):
-    """Run an action with bounded retries and best-effort cleanup between tries."""
+    """Run an action with bounded retries and best-effort cleanup between tries.
+
+    When *deadline* (a ``time.monotonic()`` value) is given, a retry only
+    starts if the time the previous attempt took still fits before it. An
+    attempt count alone is a poor bound here because the dominant cost is the
+    power cycle, which ranges from ~9s on an Arduino relay to ~100s on a PoE
+    port driven through PDUDaemon and the switch. Bounding by wall clock keeps
+    a slow backend from overrunning the caller's own boot window, which used
+    to get the whole process killed mid-attempt instead of failing cleanly.
+    """
     max_attempts = max(1, retries + 1)
     last_error = None
 
     for attempt in range(1, max_attempts + 1):
+        started = time.monotonic()
         try:
             return action()
         except Exception as exc:
             last_error = exc
             if attempt >= max_attempts:
                 raise
+
+            attempt_cost = time.monotonic() - started
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining < attempt_cost + cooldown:
+                    logger.warning(
+                        "%s failed on attempt %d/%d (%s) and the remaining budget "
+                        "(%.0fs) cannot fit another attempt (last one took %.0fs "
+                        "+ %ds cooldown); giving up",
+                        label,
+                        attempt,
+                        max_attempts,
+                        type(exc).__name__,
+                        max(0.0, remaining),
+                        attempt_cost,
+                        cooldown,
+                    )
+                    raise
+
             logger.warning(
-                "%s failed on attempt %d/%d (%s), retrying in %ds",
+                "%s failed on attempt %d/%d (%s) after %.0fs, retrying in %ds",
                 label,
                 attempt,
                 max_attempts,
                 type(exc).__name__,
+                attempt_cost,
                 cooldown,
             )
             try:
@@ -244,22 +322,16 @@ class UBootTFTPStrategy(Strategy):
         ]
 
     def _effective_uboot_retries(self) -> int:
-        """Cap configured U-Boot retries so one child cannot exhaust the boot budget."""
-        configured = _read_int_env("LG_MESH_UBOOT_RETRIES", DEFAULT_UBOOT_RETRIES)
-        login_timeout = int(getattr(self.uboot, "login_timeout", 60) or 60)
-        login_timeout = max(1, login_timeout)
-        max_attempts = max(1, DEFAULT_UBOOT_RETRY_BUDGET // login_timeout)
-        effective = min(configured, max_attempts - 1)
-        if effective != configured:
-            logger.info(
-                "Capping U-Boot retries from %d to %d for login_timeout=%ds "
-                "(budget=%ds)",
-                configured,
-                effective,
-                login_timeout,
-                DEFAULT_UBOOT_RETRY_BUDGET,
-            )
-        return effective
+        """Return the configured U-Boot retry count.
+
+        This used to cap the count by ``budget // login_timeout``, a model
+        that ignored the power cycle and so never capped anything: for a 30s
+        login_timeout it allowed 12 attempts while each attempt really cost
+        ~145s on a PoE port. The budget is now enforced as a wall-clock
+        deadline in transition_to_uboot_with_retry, which measures what an
+        attempt actually costs instead of assuming it.
+        """
+        return _read_int_env("LG_MESH_UBOOT_RETRIES", DEFAULT_UBOOT_RETRIES)
 
     def _drain_serial_buffer(self):
         """Consume stale data from the pexpect buffer after a power cycle.
@@ -367,6 +439,28 @@ class UBootTFTPStrategy(Strategy):
             time.monotonic() - spam_started,
         )
 
+    def _power_cycle_for_uboot(self):
+        """Cut power, then restore it while the interrupt spam is already running.
+
+        PDUDaemonDriver.cycle() maps to a single HTTP ``reboot`` that does not
+        return until off + delay + on have all finished. On this lab that call
+        takes 88-102s for the OpenWrt One because it queues behind other DUTs
+        on ``/tmp/switch.lock``. The autoboot window is 1-3s after power
+        actually returns, which sits somewhere inside that wait, so a spam
+        thread started around ``cycle()`` still misses it.
+
+        Splitting into ``off()`` (wait until the DUT is really dark) and
+        ``on()`` (spam wrapping the restore) makes the autoboot window
+        coincide with the spam regardless of how long ``off()`` queued.
+        """
+        self.power.off()
+        settle = _read_float_env(
+            "LG_MESH_POWER_OFF_SETTLE_SEC", DEFAULT_POWER_OFF_SETTLE_SEC
+        )
+        if settle > 0:
+            time.sleep(settle)
+        self._spam_uboot_interrupt(during=self.power.on)
+
     def _transition_to_uboot_once(self):
         """Power-cycle the node and activate the U-Boot console."""
         self.target.activate(self.tftp)
@@ -386,27 +480,30 @@ class UBootTFTPStrategy(Strategy):
         self.target.activate(self.power)
         self.target.activate(self.console)
 
-        # ORDER MATTERS: spam ACROSS the power cycle, and BEFORE drain.
-        # The DUT begins producing serial output immediately after
-        # power-on, and the autoboot window is only ~1-3 s wide. If we
-        # drain first, the drain blocks for as long as the DUT keeps
-        # talking (boot banner, Linux bootlog, etc.), by which point the
-        # kernel is booting. Spamming first ensures our interrupt bytes
-        # hit the serial inside that narrow window; the drain afterwards
-        # consumes our own echoes and the boot banner so that pexpect's
-        # buffer is clean when _await_prompt() runs.
-        self._spam_uboot_interrupt(during=self.power.cycle)
-        self._drain_serial_buffer()
-
-        self._prepare_uboot_commands(staged_file, tftp_server_ip, staged_initrd)
-        self.target.activate(self.uboot)
+        with _uboot_capture_lock():
+            # ORDER MATTERS: spam ACROSS power-on, and BEFORE drain.
+            # The DUT begins producing serial output immediately after
+            # power-on, and the autoboot window is only ~1-3 s wide. If we
+            # drain first, the drain blocks for as long as the DUT keeps
+            # talking (boot banner, Linux bootlog, etc.), by which point the
+            # kernel is booting. Spamming first ensures our interrupt bytes
+            # hit the serial inside that narrow window; the drain afterwards
+            # consumes our own echoes and the boot banner so that pexpect's
+            # buffer is clean when _await_prompt() runs.
+            self._power_cycle_for_uboot()
+            self._drain_serial_buffer()
+            self._prepare_uboot_commands(staged_file, tftp_server_ip, staged_initrd)
+            self.target.activate(self.uboot)
         self.status = Status.uboot
 
     def transition_to_uboot_with_retry(self):
-        """Reach the U-Boot prompt with bounded retries."""
+        """Reach the U-Boot prompt within the configured wall-clock budget."""
         retries = self._effective_uboot_retries()
         cooldown = _read_int_env(
             "LG_MESH_UBOOT_RETRY_COOLDOWN", DEFAULT_UBOOT_RETRY_COOLDOWN
+        )
+        budget = _read_int_env(
+            "LG_MESH_UBOOT_RETRY_BUDGET", DEFAULT_UBOOT_RETRY_BUDGET
         )
         _retry_action(
             self._transition_to_uboot_once,
@@ -414,6 +511,7 @@ class UBootTFTPStrategy(Strategy):
             retries=retries,
             cooldown=cooldown,
             label="U-Boot activation",
+            deadline=time.monotonic() + budget,
         )
 
     def run_download_commands(self):

@@ -53,22 +53,42 @@ logger = logging.getLogger(__name__)
 
 BOOT_SCRIPT = Path(__file__).parent / "mesh_boot_node.py"
 
-# One U-Boot capture attempt costs: power cycle + interrupt-spam tail +
-# serial drain + UBootDriver login_timeout. The power cycle dominates and
-# depends on the power backend: Arduino relay DUTs cycle in ~9s, while PoE
-# ports go through PDUDaemon -> SSH -> TP-Link switch and take 88-102s
-# (measured on openwrt_one). UBootTFTPStrategy retries the capture up to
-# 1 + LG_MESH_UBOOT_RETRIES times, so this budget must cover the slowest
-# backend times the full retry count. It previously assumed a single retry
-# at ~130s, which killed openwrt_one 20s after its third attempt had already
-# captured U-Boot and completed TFTP.
-UBOOT_ATTEMPT_WORST_CASE = 145
-UBOOT_MAX_ATTEMPTS = 3
+# Boot budgets, outermost first. Each layer must fit inside the one above it,
+# otherwise a node gets killed mid-attempt and reports a bare timeout instead
+# of the stage that failed.
+#
+#   BOOT_TIMEOUT_BASE            this fixture's wall clock
+#    └─ LG_MESH_BOOT_BUDGET      mesh_boot_node.py boot-attempt loop
+#        └─ UBOOT_CAPTURE_BUDGET UBootTFTPStrategy U-Boot capture retries
+#
+# A single U-Boot capture is now off() + settle + on() wrapped in interrupt
+# spam, serialized across mesh children by /tmp/labgrid-uboot-capture.lock.
+# On a PoE port that is ~20s off + 2s settle + ~20s on + 25s spam tail +
+# 30s login_timeout ≈ 100s when it is the only caller. Three sequential
+# captures plus TFTP/kernel/LibreMesh init must still fit in the parent
+# window. The capture budget covers three of those on the slowest backend.
+#
+# Because the inner layers stop on elapsed time rather than on an attempt
+# count, this scales on its own: a relay DUT finishes a capture in ~54s and
+# so gets several full boot retries inside the same budget, while a slow PoE
+# port spends it on one thorough attempt.
+#
+# These are ceilings, not costs: the fixture returns as soon as every node
+# reports, so healthy nodes (belkin ~120s, bananapi ~210s) are unaffected.
+#
+# Keep UBOOT_CAPTURE_BUDGET in sync with DEFAULT_UBOOT_RETRY_BUDGET in
+# strategies/tftpstrategy.py.
+UBOOT_CAPTURE_BUDGET = 450
 # TFTP download + kernel handoff + LibreMesh init + fixed-IP assignment.
 POST_UBOOT_BOOT_BUDGET = 150
+# Head start for the child to give up and write its status file before the
+# parent stops waiting.
+BOOT_CHILD_REPORT_MARGIN = 30
 
-BOOT_TIMEOUT_BASE = UBOOT_ATTEMPT_WORST_CASE * UBOOT_MAX_ATTEMPTS + POST_UBOOT_BOOT_BUDGET
-BOOT_TIMEOUT_PER_NODE = 30
+BOOT_TIMEOUT_BASE = (
+    UBOOT_CAPTURE_BUDGET + POST_UBOOT_BOOT_BUDGET + BOOT_CHILD_REPORT_MARGIN
+)
+BOOT_TIMEOUT_PER_NODE = 90
 NETWORK_SETTLE_TIMEOUT = 60
 SUBPROCESS_SHUTDOWN_TIMEOUT = 30
 SUBPROCESS_KILL_TIMEOUT = 10
@@ -297,10 +317,11 @@ def _get_mesh_tftp_ip() -> str:
 def _compute_boot_timeout(node_count: int) -> int:
     """Scale the boot timeout with node count.
 
-    The U-Boot gate serializes power-cycle + TFTP capture across all nodes.
-    The base timeout covers 3 nodes running the full U-Boot retry policy on
-    the slowest power backend (see BOOT_TIMEOUT_BASE); each extra node adds
-    BOOT_TIMEOUT_PER_NODE seconds.
+    UBootTFTPStrategy holds ``/tmp/labgrid-uboot-capture.lock`` around each
+    DUT's off/on + prompt capture, so N nodes queue instead of fighting over
+    ``/tmp/switch.lock``. The base timeout covers 3 sequential captures on
+    the slowest backend plus kernel/LibreMesh init (see BOOT_TIMEOUT_BASE);
+    each extra node adds BOOT_TIMEOUT_PER_NODE seconds.
     """
     extra_nodes = max(0, node_count - 3)
     return BOOT_TIMEOUT_BASE + extra_nodes * BOOT_TIMEOUT_PER_NODE
@@ -345,9 +366,20 @@ def _get_image_for_place(
 
 
 def _launch_boot_subprocess(
-    place: str, image: str, target_yaml: str, coordinator: str, tmpdir: str
+    place: str,
+    image: str,
+    target_yaml: str,
+    coordinator: str,
+    tmpdir: str,
+    boot_budget: int,
 ) -> tuple[subprocess.Popen, str, str, str]:
-    """Launch mesh_boot_node.py as a subprocess for one place."""
+    """Launch mesh_boot_node.py as a subprocess for one place.
+
+    *boot_budget* is handed to the child so its retry loop stops on the same
+    wall clock this fixture enforces. Without it the child keeps starting
+    attempts it cannot finish and gets SIGKILLed mid-boot, which reports a
+    bare timeout instead of the stage that actually failed.
+    """
     status_file = os.path.join(tmpdir, f"status_{place}.json")
     stop_file = os.path.join(tmpdir, f"stop_{place}")
     log_file = os.path.join(tmpdir, f"boot_{place}.log")
@@ -371,7 +403,12 @@ def _launch_boot_subprocess(
         stop_file,
     ]
 
-    logger.info("Launching boot subprocess for %s", place)
+    logger.info(
+        "Launching boot subprocess for %s (budget %ds)", place, boot_budget
+    )
+    child_env = dict(os.environ)
+    child_env["LG_MESH_BOOT_BUDGET"] = str(boot_budget)
+
     log_fh = open(log_file, "w")
     proc = subprocess.Popen(
         cmd,
@@ -379,6 +416,7 @@ def _launch_boot_subprocess(
         stderr=subprocess.STDOUT,
         text=True,
         cwd=str(REPO_ROOT),
+        env=child_env,
     )
     return proc, status_file, stop_file, log_file
 
@@ -654,6 +692,12 @@ def mesh_nodes(request, mesh_vlan_multi):
     failed = []
     seen_ssh_ips = {}
 
+    boot_timeout = _compute_boot_timeout(len(places))
+    # The child stops retrying slightly earlier than the parent gives up, so a
+    # node that runs out of budget reports the failing stage instead of being
+    # killed mid-attempt.
+    child_budget = max(1, boot_timeout - BOOT_CHILD_REPORT_MARGIN)
+
     try:
         for place in places:
             image_path = _get_image_for_place(place, image_map, default_image)
@@ -672,6 +716,7 @@ def mesh_nodes(request, mesh_vlan_multi):
                 target_yaml,
                 coordinator,
                 tmpdir,
+                child_budget,
             )
             procs[place] = proc
             status_files[place] = status_file
@@ -679,7 +724,6 @@ def mesh_nodes(request, mesh_vlan_multi):
             log_files[place] = log_file
 
         pending = set(places)
-        boot_timeout = _compute_boot_timeout(len(places))
         logger.info("Boot timeout for %d nodes: %ds", len(places), boot_timeout)
         deadline = time.time() + boot_timeout
         next_progress_log = time.time() + BOOT_PROGRESS_LOG_INTERVAL

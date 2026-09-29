@@ -88,6 +88,23 @@ def _boot_attempt_limit() -> int:
     return max(1, _read_int_env("LG_MESH_BOOT_ATTEMPTS", DEFAULT_BOOT_ATTEMPTS))
 
 
+def _boot_deadline():
+    """Return the monotonic deadline for this node's whole boot, or None.
+
+    The parent fixture watches a wall clock and SIGKILLs this subprocess when
+    it expires. Without the same bound here, the boot attempt loop would keep
+    starting attempts it cannot finish (3 boot attempts, each allowing 3
+    U-Boot captures at up to ~145s on a PoE port, is ~20min against a ~10min
+    window), so the node always died mid-attempt with no diagnosis instead of
+    reporting why it failed. The parent passes its own budget in
+    LG_MESH_BOOT_BUDGET.
+    """
+    budget = _read_int_env("LG_MESH_BOOT_BUDGET", 0)
+    if budget <= 0:
+        return None
+    return time.monotonic() + budget
+
+
 def _boot_retry_cooldown() -> int:
     for env_name in ("LG_MESH_BOOT_RETRY_COOLDOWN", "LG_MESH_UBOOT_RETRY_COOLDOWN"):
         if os.environ.get(env_name, "").strip():
@@ -393,10 +410,12 @@ def _run_boot_attempts(
 ) -> dict:
     """Run staged boot attempts until one succeeds or the retry budget is exhausted."""
     last_failure = None
+    deadline = _boot_deadline()
 
     for attempt in range(1, boot_attempts + 1):
         _check_stop_requested()
         logger.info("Boot attempt %d/%d for %s", attempt, boot_attempts, place)
+        started = time.monotonic()
         try:
             result = _boot_node_once(place, target, strategy)
             result["attempts_used"] = attempt
@@ -404,17 +423,33 @@ def _run_boot_attempts(
         except BootFailure as exc:
             exc.attempts_used = attempt
             last_failure = exc
+            attempt_cost = time.monotonic() - started
             logger.warning(
-                "Boot attempt %d/%d for %s failed at %s (%s): %s",
+                "Boot attempt %d/%d for %s failed after %.0fs at %s (%s): %s",
                 attempt,
                 boot_attempts,
                 place,
+                attempt_cost,
                 exc.stage,
                 exc.error_type,
                 exc.summary,
             )
             if not exc.retriable or attempt >= boot_attempts:
                 raise
+
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining < attempt_cost + retry_cooldown:
+                    logger.error(
+                        "Not retrying %s: remaining budget %.0fs cannot fit another "
+                        "attempt (last one took %.0fs + %ds cooldown)",
+                        place,
+                        max(0.0, remaining),
+                        attempt_cost,
+                        retry_cooldown,
+                    )
+                    raise
+
             _reset_after_failed_attempt(strategy, place)
             logger.info("Retrying boot of %s in %ds", place, retry_cooldown)
             for _ in range(retry_cooldown):
