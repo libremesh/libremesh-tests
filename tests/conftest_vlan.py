@@ -197,4 +197,15 @@ def mesh_vlan_multi():
 
     os.environ.pop("TFTP_SERVER_IP", None)
     logger.info("Restoring %d mesh DUTs to isolated VLANs", len(dut_names))
-    _restore_vlans(dut_names)
+    if _restore_vlans(dut_names):
+        logger.info("Restored %d mesh DUTs to isolated VLANs", len(dut_names))
+    else:
+        # Discarding this used to hide the leak until an unrelated job failed
+        # much later: a DUT left on the mesh VLAN is unreachable over its own
+        # VLAN, so the next run dies in TFTP or SSH with no mention of VLANs.
+        logger.error(
+            "VLAN restore FAILED for %s; these DUTs are stranded on VLAN %d. "
+            "Run 'switch-vlan --restore-all' on the lab host before the next run.",
+            dut_names,
+            VLAN_MESH,
+        )
