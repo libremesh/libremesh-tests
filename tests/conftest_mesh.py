@@ -88,7 +88,11 @@ BOOT_CHILD_REPORT_MARGIN = 30
 BOOT_TIMEOUT_BASE = (
     UBOOT_CAPTURE_BUDGET + POST_UBOOT_BOOT_BUDGET + BOOT_CHILD_REPORT_MARGIN
 )
-BOOT_TIMEOUT_PER_NODE = 90
+# Cost of one successful capture on the slowest backend. Since the capture
+# lock makes nodes queue, every node may wait this long per peer ahead of it,
+# starting from the second node -- not from the fourth like the old per-node
+# term assumed.
+UBOOT_CAPTURE_TYPICAL = 100
 NETWORK_SETTLE_TIMEOUT = 60
 SUBPROCESS_SHUTDOWN_TIMEOUT = 30
 SUBPROCESS_KILL_TIMEOUT = 10
@@ -319,12 +323,12 @@ def _compute_boot_timeout(node_count: int) -> int:
 
     UBootTFTPStrategy holds ``/tmp/labgrid-uboot-capture.lock`` around each
     DUT's off/on + prompt capture, so N nodes queue instead of fighting over
-    ``/tmp/switch.lock``. The base timeout covers 3 sequential captures on
-    the slowest backend plus kernel/LibreMesh init (see BOOT_TIMEOUT_BASE);
-    each extra node adds BOOT_TIMEOUT_PER_NODE seconds.
+    ``/tmp/switch.lock``. BOOT_TIMEOUT_BASE covers one node's full retry
+    budget plus kernel/LibreMesh init; on top of that the last node in the
+    queue can wait one capture per peer ahead of it.
     """
-    extra_nodes = max(0, node_count - 3)
-    return BOOT_TIMEOUT_BASE + extra_nodes * BOOT_TIMEOUT_PER_NODE
+    queue_wait = max(0, node_count - 1) * UBOOT_CAPTURE_TYPICAL
+    return BOOT_TIMEOUT_BASE + queue_wait
 
 
 def _compute_network_settle_timeout(node_count: int) -> int:

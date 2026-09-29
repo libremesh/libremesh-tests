@@ -34,7 +34,10 @@ SERIAL_DRAIN_TOTAL_MAX = 3.0
 # that board and the OpenWrt One (whose window is only 1-3s after PoE returns).
 DEFAULT_UBOOT_INTERRUPT_SPAM_SEC = 25.0
 DEFAULT_UBOOT_INTERRUPT_SPAM_INTERVAL = 0.05
-DEFAULT_POWER_OFF_SETTLE_SEC = 2.0
+# Matches PDUDaemonDriver.delay, the gap `cycle()` used to leave between off
+# and on. A shorter gap can leave the SoC alive on residual rail charge, so
+# the DUT never actually resets and there is no autoboot window to catch.
+DEFAULT_POWER_OFF_SETTLE_SEC = 5.0
 DEFAULT_UBOOT_CAPTURE_LOCK = "/tmp/labgrid-uboot-capture.lock"
 
 
