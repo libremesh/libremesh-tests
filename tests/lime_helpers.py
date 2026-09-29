@@ -480,7 +480,24 @@ def configure_fixed_ip(
     for attempt in range(1, max_attempts + 1):
         iface = find_lan_interface(shell)
         if not iface:
-            logger.error("No suitable network interface found for fixed IP")
+            # Transient on slow devices: LibreMesh creates br-lan only after
+            # wifi/batman init, which on a LibreRouter booted from ramdisk
+            # exceeds find_lan_interface's own wait. Returning here defeated
+            # the retry loop, so the first test to need SSH failed while every
+            # later one succeeded against the same DUT.
+            if attempt < max_attempts:
+                logger.warning(
+                    "No LAN interface up yet (attempt %d/%d); retrying in %ds",
+                    attempt,
+                    max_attempts,
+                    retry_delay,
+                )
+                time.sleep(retry_delay)
+                continue
+            logger.error(
+                "No suitable network interface found for fixed IP after %d attempts",
+                max_attempts,
+            )
             return None
         logger.info(
             "Using interface %s for fixed IP (attempt %d/%d)",
