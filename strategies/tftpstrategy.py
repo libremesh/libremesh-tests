@@ -3,6 +3,7 @@ import hashlib
 import ipaddress
 import logging
 import os
+import threading
 import time
 
 import attr
@@ -278,8 +279,8 @@ class UBootTFTPStrategy(Strategy):
         except Exception:
             pass
 
-    def _spam_uboot_interrupt(self):
-        """Blast the U-Boot interrupt byte at a steady rate right after power-up.
+    def _spam_uboot_interrupt(self, during=None):
+        """Blast the U-Boot interrupt byte at a steady rate around power-up.
 
         Rationale: when the serial console is proxied over a high-latency SSH
         tunnel (e.g. remote developer running via labgrid-coordinator
@@ -293,12 +294,21 @@ class UBootTFTPStrategy(Strategy):
         jitter. Bytes at the U-Boot prompt are harmless (they produce empty
         command echoes that are consumed by the next expect).
 
+        ``during`` is the power-cycle call. It runs while a background thread
+        keeps writing, because the call does not necessarily return at the
+        moment power is restored: relay-driven DUTs cycle in ~9 s, but PoE
+        ports driven over SSH to the switch take 90-100 s, during which the
+        DUT powers up and boots past the autoboot window. Writing only after
+        the call returns misses that window entirely.
+
         Opt-out with LG_MESH_UBOOT_INTERRUPT_SPAM_SEC=0.
         """
         duration = _read_float_env(
             "LG_MESH_UBOOT_INTERRUPT_SPAM_SEC", DEFAULT_UBOOT_INTERRUPT_SPAM_SEC
         )
         if duration <= 0:
+            if during is not None:
+                during()
             return
 
         interval = _read_float_env(
@@ -309,21 +319,48 @@ class UBootTFTPStrategy(Strategy):
         interrupt_bytes = raw_char.encode("ASCII")
 
         logger.info(
-            "Spamming U-Boot interrupt for %.1fs (interval=%.3fs)",
+            "Spamming U-Boot interrupt during power-cycle and for %.1fs after "
+            "it returns (interval=%.3fs)",
             duration,
             interval,
         )
-        deadline = time.monotonic() + duration
-        writes = 0
-        while time.monotonic() < deadline:
-            try:
-                self.console.write(interrupt_bytes)
-                writes += 1
-            except Exception:
-                logger.debug("U-Boot interrupt spam write failed", exc_info=True)
-                break
-            time.sleep(interval)
-        logger.debug("U-Boot interrupt spam sent %d writes", writes)
+
+        stop = threading.Event()
+        state = {"writes": 0, "errors": 0}
+
+        def _write_loop():
+            # Writes while the DUT is still powered off raise; keep going so
+            # the spam resumes as soon as the console comes back, instead of
+            # giving up before the autoboot window even opens.
+            while not stop.is_set():
+                try:
+                    self.console.write(interrupt_bytes)
+                    state["writes"] += 1
+                except Exception:
+                    state["errors"] += 1
+                    if state["errors"] == 1:
+                        logger.debug(
+                            "U-Boot interrupt spam write failed", exc_info=True
+                        )
+                stop.wait(interval)
+
+        writer = threading.Thread(
+            target=_write_loop, name="uboot-interrupt-spam", daemon=True
+        )
+        writer.start()
+        try:
+            if during is not None:
+                during()
+            stop.wait(duration)
+        finally:
+            stop.set()
+            writer.join(timeout=interval * 4 + 1.0)
+
+        logger.debug(
+            "U-Boot interrupt spam sent %d writes (%d failed)",
+            state["writes"],
+            state["errors"],
+        )
 
     def _transition_to_uboot_once(self):
         """Power-cycle the node and activate the U-Boot console."""
@@ -344,18 +381,16 @@ class UBootTFTPStrategy(Strategy):
         self.target.activate(self.power)
         self.target.activate(self.console)
 
-        self.power.cycle()
-        # ORDER MATTERS: spam BEFORE drain.
+        # ORDER MATTERS: spam ACROSS the power cycle, and BEFORE drain.
         # The DUT begins producing serial output immediately after
-        # power-on. If we drain first, the drain blocks for as long as
-        # the DUT keeps talking (boot banner, Linux bootlog, etc.),
-        # which on a jittery tunnel can take 15-20 s. By then the
-        # U-Boot autoboot window (~1-3 s post power-on) has closed and
-        # the kernel is booting. Spamming first ensures our interrupt
-        # bytes hit the serial inside that narrow window; the drain
-        # afterwards consumes our own echoes and the boot banner so
-        # that pexpect's buffer is clean when _await_prompt() runs.
-        self._spam_uboot_interrupt()
+        # power-on, and the autoboot window is only ~1-3 s wide. If we
+        # drain first, the drain blocks for as long as the DUT keeps
+        # talking (boot banner, Linux bootlog, etc.), by which point the
+        # kernel is booting. Spamming first ensures our interrupt bytes
+        # hit the serial inside that narrow window; the drain afterwards
+        # consumes our own echoes and the boot banner so that pexpect's
+        # buffer is clean when _await_prompt() runs.
+        self._spam_uboot_interrupt(during=self.power.cycle)
         self._drain_serial_buffer()
 
         self._prepare_uboot_commands(staged_file, tftp_server_ip, staged_initrd)
