@@ -524,9 +524,7 @@ class UBootTFTPStrategy(Strategy):
         cooldown = _read_int_env(
             "LG_MESH_UBOOT_RETRY_COOLDOWN", DEFAULT_UBOOT_RETRY_COOLDOWN
         )
-        budget = _read_int_env(
-            "LG_MESH_UBOOT_RETRY_BUDGET", DEFAULT_UBOOT_RETRY_BUDGET
-        )
+        budget = _read_int_env("LG_MESH_UBOOT_RETRY_BUDGET", DEFAULT_UBOOT_RETRY_BUDGET)
         _retry_action(
             self._transition_to_uboot_once,
             lambda: self.transition(Status.off),
