@@ -7,6 +7,7 @@ import os
 import threading
 import time
 from contextlib import contextmanager
+from urllib.parse import urlparse
 
 import attr
 from labgrid.driver import TFTPProviderDriver
@@ -15,6 +16,21 @@ from labgrid.resource.remote import RemoteTFTPProvider
 from labgrid.strategy.common import Strategy, StrategyError
 
 logger = logging.getLogger(__name__)
+
+
+def _split_staged(staged):
+    """Return (bootfile, server_ip) for a file staged by TFTPProviderDriver.
+
+    Exporter configs following current openwrt-tests set the TFTPProvider
+    ``external`` to a full ``tftp://<host>/<path>/`` URL; older ones use a
+    plain relative path. U-Boot needs the bare path as ``bootfile``: given the
+    URL verbatim it asks the server for a file literally named ``tftp://...``.
+    """
+    parsed = urlparse(staged)
+    if parsed.scheme == "tftp":
+        return parsed.path.lstrip("/"), parsed.hostname
+    return staged, None
+
 
 TFTP_DOWNLOAD_TIMEOUT = 120
 TFTP_RETRY_INTERVAL = 5
@@ -467,17 +483,20 @@ class UBootTFTPStrategy(Strategy):
     def _transition_to_uboot_once(self):
         """Power-cycle the node and activate the U-Boot console."""
         self.target.activate(self.tftp)
-        staged_file = self.tftp.stage(self.target.env.config.get_image_path("root"))
+        staged_file, url_server_ip = _split_staged(
+            self.tftp.stage(self.target.env.config.get_image_path("root"))
+        )
 
         staged_initrd = None
         try:
             initrd_path = self.target.env.config.get_image_path("initrd")
-            staged_initrd = self.tftp.stage(initrd_path)
+            staged_initrd, _ = _split_staged(self.tftp.stage(initrd_path))
             logger.info("Staged initrd image: %s", staged_initrd)
         except KeyError:
             pass
 
-        tftp_server_ip = self._resolve_tftp_server_ip()
+        # Precedence: TFTP_SERVER_IP env, exporter external_ip, host of the URL.
+        tftp_server_ip = self._resolve_tftp_server_ip() or url_server_ip
 
         self.target.deactivate(self.console)
         self.target.activate(self.power)
@@ -505,9 +524,7 @@ class UBootTFTPStrategy(Strategy):
         cooldown = _read_int_env(
             "LG_MESH_UBOOT_RETRY_COOLDOWN", DEFAULT_UBOOT_RETRY_COOLDOWN
         )
-        budget = _read_int_env(
-            "LG_MESH_UBOOT_RETRY_BUDGET", DEFAULT_UBOOT_RETRY_BUDGET
-        )
+        budget = _read_int_env("LG_MESH_UBOOT_RETRY_BUDGET", DEFAULT_UBOOT_RETRY_BUDGET)
         _retry_action(
             self._transition_to_uboot_once,
             lambda: self.transition(Status.off),

@@ -407,9 +407,7 @@ def _launch_boot_subprocess(
         stop_file,
     ]
 
-    logger.info(
-        "Launching boot subprocess for %s (budget %ds)", place, boot_budget
-    )
+    logger.info("Launching boot subprocess for %s (budget %ds)", place, boot_budget)
     child_env = dict(os.environ)
     child_env["LG_MESH_BOOT_BUDGET"] = str(boot_budget)
 
