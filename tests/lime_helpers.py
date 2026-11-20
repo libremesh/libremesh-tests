@@ -858,3 +858,75 @@ def ensure_batman_mesh(target, place_name: str | None = None) -> bool:
 
     logger.warning("Could not activate batman-adv mesh")
     return False
+
+
+# ---------------------------------------------------------------------------
+# End-of-session lime-report
+# ---------------------------------------------------------------------------
+
+LIME_REPORT_TIMEOUT = _read_int_env("LIME_REPORT_TIMEOUT", 180)
+
+
+def lime_report_dir(config=None) -> Path | None:
+    """Return the directory where end-of-session lime-report files go.
+
+    Resolution order:
+    1. ``LIME_REPORT_DIR`` env var.
+    2. Parent directory of ``LIME_REPORT_OUTPUT`` (legacy single-file knob).
+    3. labgrid's ``--lg-log`` directory, so every CI job that already uploads
+       its log directory gets the report without extra configuration.
+
+    Returns ``None`` when none of them is set (local runs without logging).
+    """
+    explicit = os.environ.get("LIME_REPORT_DIR", "").strip()
+    if explicit:
+        return Path(explicit)
+    output = os.environ.get("LIME_REPORT_OUTPUT", "").strip()
+    if output:
+        return Path(output).parent
+    option = getattr(config, "option", None)
+    lg_log = getattr(option, "lg_log", None)
+    if lg_log:
+        return Path(lg_log)
+    return None
+
+
+def lime_report_filename(label: str | None = None) -> str:
+    """``lime-report.md`` for single-node runs, ``lime-report-<label>.md`` per mesh node."""
+    if not label:
+        return "lime-report.md"
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", label).strip("_") or "node"
+    return f"lime-report-{safe}.md"
+
+
+def save_lime_report(path: Path, run) -> bool:
+    """Run ``lime-report`` through *run* and write its output to *path*.
+
+    *run* must behave like ``SSHDriver.run``: ``run(cmd, timeout=...)``
+    returning ``(stdout_lines, stderr_lines, exit_code)``. Never raises: when
+    the DUT cannot be reached the file still gets written with the reason,
+    so a missing report is distinguishable from a report that was never
+    attempted. Returns ``True`` when real report output was captured.
+    """
+    ok = False
+    try:
+        stdout, stderr, rc = run("lime-report", timeout=LIME_REPORT_TIMEOUT)
+        output = "\n".join(stdout).strip()
+        if output:
+            ok = True
+        else:
+            err = "\n".join(stderr).strip()
+            output = f"_lime-report produced no output (exit code {rc})._"
+            if err:
+                output += f"\n\nstderr:\n\n```\n{err}\n```"
+    except Exception as exc:  # noqa: BLE001 - report collection must not abort teardown
+        output = f"_Could not collect lime-report: {exc}_"
+
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(output + "\n")
+        logger.info("lime-report written: %s (%d bytes)", path, len(output))
+    except OSError as exc:
+        logger.warning("Could not write lime-report to %s: %s", path, exc)
+        return False
+    return ok

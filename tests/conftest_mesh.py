@@ -43,7 +43,14 @@ from typing import Optional
 
 import pytest
 from conftest_vlan import _resolve_proxy_host
-from lime_helpers import REPO_ROOT, generate_mesh_ssh_ip, resolve_target_yaml
+from lime_helpers import (
+    REPO_ROOT,
+    generate_mesh_ssh_ip,
+    lime_report_dir,
+    lime_report_filename,
+    resolve_target_yaml,
+    save_lime_report,
+)
 
 # Allow importing scripts from repo root
 if str(REPO_ROOT) not in sys.path:
@@ -272,6 +279,29 @@ class SSHProxy:
             return stdout, stderr, last_result.returncode
         except subprocess.TimeoutExpired:
             return [], ["SSH command timed out"], 1
+
+    def run_raw(
+        self, command: str, timeout: int = SSH_COMMAND_TIMEOUT
+    ) -> tuple[list[str], list[str], int]:
+        """Like :meth:`run` but keeps blank lines and does not retry.
+
+        Used for long, formatted output such as ``lime-report`` (Markdown),
+        where dropping empty lines breaks the layout.
+        """
+        try:
+            result = subprocess.run(
+                self._build_ssh_cmd(command),
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired:
+            return [], ["SSH command timed out"], 1
+        return (
+            result.stdout.splitlines(),
+            result.stderr.splitlines(),
+            result.returncode,
+        )
 
 
 @dataclass
@@ -547,7 +577,28 @@ def _configure_vwifi_node(
     return rc == 0
 
 
-def _mesh_nodes_virtual():
+def _collect_mesh_lime_reports(config, nodes: list["MeshNode"]) -> None:
+    """Write one ``lime-report-<place>.md`` per mesh node before teardown.
+
+    Destination is :func:`lime_helpers.lime_report_dir` (``LIME_REPORT_DIR``
+    or the ``--lg-log`` directory). Failures are logged, never raised, so a
+    node that died mid-session does not hide the reports of the others.
+    """
+    report_dir = lime_report_dir(config)
+    if report_dir is None or not nodes:
+        return
+    for node in nodes:
+        path = report_dir / lime_report_filename(node.place)
+        ok = save_lime_report(path, node.ssh.run_raw)
+        logger.info(
+            "Node %s: lime-report %s → %s",
+            node.place,
+            "collected" if ok else "NOT collected",
+            path,
+        )
+
+
+def _mesh_nodes_virtual(config=None):
     """Launch virtual mesh (QEMU + vwifi) and yield MeshNode list.
 
     Uses LG_VIRTUAL_MESH=1, VIRTUAL_MESH_IMAGE, VIRTUAL_MESH_NODES.
@@ -628,10 +679,12 @@ def _mesh_nodes_virtual():
     )
     _wait_for_network(mesh_nodes_list, timeout=settle_timeout)
 
-    yield mesh_nodes_list
-
-    logger.info("Tearing down %d virtual mesh nodes", len(mesh_nodes_list))
-    cleanup()
+    try:
+        yield mesh_nodes_list
+    finally:
+        _collect_mesh_lime_reports(config, mesh_nodes_list)
+        logger.info("Tearing down %d virtual mesh nodes", len(mesh_nodes_list))
+        cleanup()
 
 
 @pytest.fixture(scope="session")
@@ -650,7 +703,7 @@ def mesh_nodes(request, mesh_vlan_multi):
     Virtual: LG_VIRTUAL_MESH=1, VIRTUAL_MESH_IMAGE, VIRTUAL_MESH_NODES.
     """
     if os.environ.get("LG_VIRTUAL_MESH") == "1":
-        yield from _mesh_nodes_virtual()
+        yield from _mesh_nodes_virtual(request.config)
         return
 
     places_str = os.environ.get("LG_MESH_PLACES", "")
@@ -841,7 +894,12 @@ def mesh_nodes(request, mesh_vlan_multi):
         )
         _wait_for_network(nodes, timeout=settle_timeout)
 
-        yield nodes
+        try:
+            yield nodes
+        finally:
+            # DUTs are still powered and reachable here; the boot
+            # subprocesses below are what power them down.
+            _collect_mesh_lime_reports(request.config, nodes)
     finally:
         if procs:
             logger.info("Tearing down %d mesh boot subprocesses", len(procs))
