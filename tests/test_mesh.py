@@ -13,6 +13,7 @@ import re
 import time
 
 import pytest
+import shared_state_helpers as ss
 from lime_helpers import is_mesh_ipv4, select_mesh_ipv4, select_primary_ipv4
 
 pytestmark = pytest.mark.mesh
@@ -283,3 +284,99 @@ class TestLibreMeshServices:
             if "NO_LIME" in joined:
                 pytest.skip("lime-defaults not present")
             logger.info("Node %s lime config:\n%s", node.place, joined[:300])
+
+
+class TestMeshSharedState:
+    """shared-state-async across the mesh: every node sees the others' data."""
+
+    @staticmethod
+    def _require_shared_state(mesh_nodes):
+        statuses = [
+            (node.place, *ss.daemon_status(node.ssh.run)) for node in mesh_nodes
+        ]
+        stopped = [
+            place for place, installed, running in statuses if installed and not running
+        ]
+        assert not stopped, (
+            "shared-state-async package is installed but its peer daemon is not "
+            f"running on: {', '.join(stopped)}"
+        )
+
+        missing = [place for place, installed, _ in statuses if not installed]
+        if missing:
+            pytest.skip(
+                "shared-state-async package is not installed on: "
+                + ", ".join(missing)
+            )
+
+    def test_shared_state_async_running_on_all_nodes(self, mesh_nodes):
+        """shared-state-async is installed and its daemon runs on every node."""
+        self._require_shared_state(mesh_nodes)
+
+    def test_shared_state_async_sees_other_nodes(self, mesh_nodes):
+        """Each node ends up holding bat-hosts entries authored by every other node.
+
+        Publishes bat-hosts on all nodes, then polls each node's dump until
+        automatic synchronization makes every mesh hostname visible, or
+        SHARED_STATE_MESH_TIMEOUT expires.
+        """
+        self._require_shared_state(mesh_nodes)
+        if len(mesh_nodes) < 2:
+            pytest.skip("Need at least 2 mesh nodes to check data exchange")
+
+        hostnames = {node.place: ss.get_hostname(node.ssh.run) for node in mesh_nodes}
+        if len(set(hostnames.values())) != len(hostnames):
+            pytest.fail(
+                f"Mesh nodes share hostnames {hostnames}; shared-state authors "
+                "cannot tell them apart"
+            )
+        expected = set(hostnames.values())
+
+        for node in mesh_nodes:
+            rc, out = ss.publish(node.ssh.run)
+            assert rc == 0, f"{node.place}: bat-hosts publisher failed (rc={rc}): {out}"
+
+        seen: dict[str, set[str]] = {}
+        missing: dict[str, list[str]] = {}
+        started = time.monotonic()
+        deadline = started + ss.MESH_TIMEOUT
+        first_check_at = started + ss.MIN_MESH_SYNC_WAIT
+        attempt = 0
+        while True:
+            now = time.monotonic()
+            if now < first_check_at:
+                time.sleep(min(first_check_at - now, deadline - now))
+
+            attempt += 1
+            for node in mesh_nodes:
+                authors, _, _ = ss.dump_authors(node.ssh.run)
+                seen[node.place] = authors
+            missing = {
+                place: sorted(expected - authors)
+                for place, authors in seen.items()
+                if expected - authors
+            }
+            logger.info(
+                "shared-state round %d: %s",
+                attempt,
+                {hostnames[p]: sorted(a) for p, a in seen.items()},
+            )
+            if not missing or time.monotonic() >= deadline:
+                break
+            time.sleep(min(ss.POLL_INTERVAL, max(0, deadline - time.monotonic())))
+
+        if missing:
+            details = []
+            for node in mesh_nodes:
+                if node.place not in missing:
+                    continue
+                candidates = ss.discover_candidates(node.ssh.run)
+                details.append(
+                    f"  {node.place} ({hostnames[node.place]}): has "
+                    f"{sorted(seen[node.place])}, missing {missing[node.place]}, "
+                    f"shared-state neighbour candidates: {candidates or 'none'}"
+                )
+            pytest.fail(
+                f"shared-state {ss.SS_DATATYPE} did not converge after "
+                f"{ss.MESH_TIMEOUT}s ({attempt} polling rounds):\n" + "\n".join(details)
+            )

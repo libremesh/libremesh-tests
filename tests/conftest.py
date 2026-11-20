@@ -33,7 +33,10 @@ from lime_helpers import (  # noqa: E402
     configure_fixed_ip,
     ensure_batman_mesh,
     is_qemu_target,
+    lime_report_dir,
+    lime_report_filename,
     resolve_target_yaml,
+    save_lime_report,
     suppress_kernel_console,
 )
 
@@ -181,7 +184,12 @@ def collect_lime_report(pytestconfig):
 
     Runs as a session-scoped autouse fixture so it tears down BEFORE
     labgrid's ``env.cleanup()`` — the SSHDriver is still active here.
-    Writes the output to the path in ``LIME_REPORT_OUTPUT`` if set.
+
+    Output path: ``LIME_REPORT_OUTPUT`` if set, otherwise
+    ``lime-report.md`` inside the directory resolved by
+    :func:`lime_helpers.lime_report_dir` (``LIME_REPORT_DIR`` or the
+    ``--lg-log`` directory). Every CI job passes ``--lg-log``, so physical
+    and QEMU runs both end with a report next to the console logs.
 
     Resolves the labgrid target lazily via pytestconfig.stash instead of
     depending on the ``target`` fixture directly, mirroring the pattern used
@@ -189,12 +197,19 @@ def collect_lime_report(pytestconfig):
     (conftest_mesh.py) run without ``--lg-env`` and therefore labgrid never
     creates an ``env``. If this fixture depended on ``target``, every mesh
     session would be aborted with ``missing environment config (use --lg-env)``.
+    Mesh sessions collect one report per node in the ``mesh_nodes`` teardown
+    (conftest_mesh.py), while the VMs/DUTs are still up.
     """
     yield
 
-    report_path = os.environ.get("LIME_REPORT_OUTPUT")
-    if not report_path:
-        return
+    explicit_output = os.environ.get("LIME_REPORT_OUTPUT", "").strip()
+    if explicit_output:
+        report_path = Path(explicit_output)
+    else:
+        report_dir = lime_report_dir(pytestconfig)
+        if report_dir is None:
+            return
+        report_path = report_dir / lime_report_filename()
 
     try:
         from labgrid.pytestplugin.hooks import LABGRID_ENV_KEY
@@ -204,8 +219,8 @@ def collect_lime_report(pytestconfig):
         env = None
 
     if env is None:
-        # No labgrid env active (typical for multi-node mesh tests): skip
-        # lime-report silently; mesh-specific reporting lives in conftest_mesh.
+        # No labgrid env active (multi-node mesh session): the per-node
+        # reports are written by the mesh_nodes fixture teardown.
         return
 
     try:
@@ -213,18 +228,16 @@ def collect_lime_report(pytestconfig):
         if target is None:
             return
         ssh = target.get_driver("SSHDriver")
-        stdout, stderr, rc = ssh.run("lime-report", timeout=60)
-        output = "\n".join(stdout).strip()
-        if not output:
-            output = "_lime-report ran but produced no output._"
-        Path(report_path).write_text(output)
-        print(
-            f"\nlime-report collected: {len(output)} bytes → {report_path}", flush=True
-        )
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - report collection must not abort teardown
         msg = f"_Could not collect lime-report: {exc}_"
-        print(f"\n[WARN] {msg}", file=__import__("sys").stderr, flush=True)
+        print(f"\n[WARN] {msg}", file=sys.stderr, flush=True)
         try:
-            Path(report_path).write_text(msg)
-        except Exception:
+            report_path.parent.mkdir(parents=True, exist_ok=True)
+            report_path.write_text(msg + "\n")
+        except OSError:
             pass
+        return
+
+    ok = save_lime_report(report_path, ssh.run)
+    status = "collected" if ok else "NOT collected (see file for reason)"
+    print(f"\nlime-report {status} → {report_path}", flush=True)

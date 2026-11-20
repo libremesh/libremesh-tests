@@ -11,8 +11,10 @@ based on the device MAC, so SSH connectivity works without per-VLAN isolation.
 
 import ipaddress
 import re
+import time
 
 import pytest
+import shared_state_helpers as ss
 
 
 class TestLibreMeshConfig:
@@ -193,3 +195,64 @@ class TestLibreMeshServices:
         """Verify OpenWrt network service is running."""
         stdout, _, rc = ssh_command.run("/etc/init.d/network status")
         assert rc == 0, "Network service is not running"
+
+
+class TestSharedStateAsync:
+    """shared-state-async on a single node.
+
+    On an isolated node the CRDT store must hold only data authored by the
+    node itself. If the node turns out to have shared-state neighbours (for
+    example another LibreMesh node in WiFi range of a physical DUT) the
+    isolation premise does not hold and the check is skipped, not failed.
+    """
+
+    @staticmethod
+    def _require_shared_state(run):
+        installed, running = ss.daemon_status(run)
+        if not installed:
+            pytest.skip("shared-state-async package is not installed")
+        assert running, "shared-state-async peer daemon is not running"
+
+    def test_shared_state_async_running(self, ssh_command):
+        """shared-state-async is installed and its peer daemon is up."""
+        self._require_shared_state(ssh_command.run)
+
+    def test_shared_state_async_single_node_holds_only_own_data(self, ssh_command):
+        """After publishing bat-hosts, automatic sync leaves only local data."""
+        run = ssh_command.run
+        self._require_shared_state(run)
+        hostname = ss.get_hostname(run)
+
+        rc, out = ss.publish(run)
+        assert rc == 0, f"bat-hosts publisher failed (rc={rc}): {out}"
+
+        deadline = time.monotonic() + ss.SINGLE_NODE_TIMEOUT
+        while True:
+            authors, raw, dump_rc = ss.dump_authors(run)
+            if hostname in authors or time.monotonic() >= deadline:
+                break
+            time.sleep(ss.POLL_INTERVAL)
+
+        assert hostname in authors, (
+            f"{ss.SS_DATATYPE} has no entries authored by this node ({hostname}) "
+            f"{ss.SINGLE_NODE_TIMEOUT}s after publishing (dump rc={dump_rc}).\n"
+            f"Authors seen: {sorted(authors)}\nDump:\n{ss.truncate(raw)}"
+        )
+
+        foreign = authors - {hostname}
+        if not foreign:
+            return
+
+        candidates = ss.discover_candidates(run)
+        if candidates:
+            pytest.skip(
+                f"Node {hostname} is not isolated: shared-state found "
+                f"{len(candidates)} neighbour candidate(s) {candidates[:5]} and "
+                f"holds data from {sorted(foreign)}. Single-node premise does "
+                "not apply."
+            )
+        pytest.fail(
+            f"Isolated node {hostname} (no shared-state neighbours) holds "
+            f"{ss.SS_DATATYPE} data authored by other nodes: {sorted(foreign)}.\n"
+            f"Dump:\n{ss.truncate(raw)}"
+        )
