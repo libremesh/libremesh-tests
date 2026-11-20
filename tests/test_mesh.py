@@ -305,8 +305,7 @@ class TestMeshSharedState:
         missing = [place for place, installed, _ in statuses if not installed]
         if missing:
             pytest.skip(
-                "shared-state-async package is not installed on: "
-                + ", ".join(missing)
+                "shared-state-async package is not installed on: " + ", ".join(missing)
             )
 
     def test_shared_state_async_running_on_all_nodes(self, mesh_nodes):
